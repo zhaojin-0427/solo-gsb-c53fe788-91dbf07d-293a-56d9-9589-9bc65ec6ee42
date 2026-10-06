@@ -174,6 +174,31 @@
           </div>
           <div id="verify-result"></div>
         </div>
+
+        <!-- DMX 信号回放 -->
+        <h2>DMX 信号回放</h2>
+        <div id="replay-panel">
+          <p class="muted">
+            选择一份已发布方案，上传信号 CSV（UTF-8，需含表头：<code>时间(毫秒),线路,通道,值</code>；
+            时间为非负毫秒、线路 1-4、通道 1-512、值 0-255），每行更新一个槽位。
+            服务端从所选版本的<strong>发布快照</strong>恢复灯具闭区间与保留区，按时间重建帧：
+            同一毫秒的多行合为一帧，槽位初值为 0，未更新的值延续上一帧。
+            页面按灯具展示相对通道读数及变化；有快照时逐帧列出保留区与未分配通道的非零值
+            （旧发布记录无快照时，灯具外非零值继续显示但归属未知，不会用当前保留区反推）。
+            同一毫秒同槽出现不同值时，可选择整表拒收或按文件顺序取末值（结果中逐项标注）。
+            回放为只读操作，不修改编排数据。
+          </p>
+          <div class="toolbar">
+            <select id="replay-plan-select"></select>
+            <input type="file" id="replay-file" accept=".csv,text/csv" />
+            <select id="replay-policy" title="同一毫秒、同一槽位出现不同值时的处理策略">
+              <option value="reject">同毫秒同槽不同值：整表拒收</option>
+              <option value="last">同毫秒同槽不同值：按文件顺序取末值</option>
+            </select>
+            <button id="btn-replay" class="primary">上传并回放</button>
+          </div>
+          <div id="replay-result"></div>
+        </div>
       </div>
     </section>
   </main>

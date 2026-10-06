@@ -99,6 +99,28 @@ code { background: #eef2f7; padding: 1px 5px; border-radius: 4px; font-size: 12p
 #verify-result p { margin: 4px 0 8px; }
 .diff-bad { color: var(--danger); font-weight: 600; }
 
+/* DMX 信号回放 */
+#replay-panel select { min-width: 220px; }
+#replay-result h3 { font-size: 14px; margin: 18px 0 8px; }
+.replay-nav {
+  display: flex; align-items: center; gap: 8px; margin: 12px 0;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  position: sticky; top: 0; z-index: 5; flex-wrap: wrap;
+}
+.replay-fixtures { display: flex; flex-direction: column; gap: 8px; }
+.replay-fixture {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
+}
+.replay-fixture .title { font-weight: 600; margin-bottom: 4px; }
+.dmx-chip {
+  display: inline-block; background: #f1f5f9; border: 1px solid var(--border);
+  border-radius: 12px; padding: 2px 10px; font-size: 12px; margin: 2px 6px 2px 0;
+}
+.dmx-chip.changed { background: #fef3c7; border-color: var(--warn-border); }
+.dmx-chip em.chg { color: var(--danger); font-style: normal; font-size: 11px; margin-left: 2px; }
+#replay-result td.written-now { background: #fef9c3; }
+#replay-result tr.zero-row { color: var(--muted); }
+
 #conflict-panel { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
 #conflict-panel h2 { color: var(--danger); margin-top: 0; }
 #conflict-list li { margin: 4px 0; }

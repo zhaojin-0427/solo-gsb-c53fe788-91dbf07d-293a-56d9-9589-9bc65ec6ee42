@@ -1,14 +1,14 @@
-"""编排预览、原子发布、已发布地址表查询与 CSV 下载、现场地址核验。"""
+"""编排预览、原子发布、已发布地址表查询与 CSV 下载、现场地址核验、DMX 信号回放。"""
 from __future__ import annotations
 
 import csv
 import io
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from .. import planner, verify
+from .. import planner, replay as replaylib, verify
 from ..database import get_db
 from ..models import Plan
 from ..services import get_config_version
@@ -163,3 +163,66 @@ async def verify_on_site(plan_id: int, file: UploadFile = File(...), db: Session
         report["notice"] = payload["notice"]
         report["field_sources"] = payload.get("field_sources")
     return report
+
+
+@router.post("/{plan_id}/replay")
+async def replay_dmx(
+    plan_id: int,
+    file: UploadFile = File(...),
+    conflict_policy: str = Form(replaylib.POLICY_REJECT),
+    db: Session = Depends(get_db),
+):
+    """DMX 信号回放：上传信号 CSV，按所选已发布版本发布时的落点重建帧。
+
+    CSV 四列：非负毫秒时间、线路（1-4）、通道（1-512）、值（0-255），每行
+    更新一个槽位；同一毫秒的多行合为一帧，槽位初值 0 且未更新值延续上一帧。
+    归属只认所选版本的发布快照（灯具闭区间与保留区）；无快照的旧记录按留存
+    落点解读灯具，灯具外槽位标为归属未知，不读取当前落点与当前保留区。
+    非法数据一律整表拒收（422）；同毫秒同槽不同值由 conflict_policy 决定
+    （reject 整表拒收 / last 按文件顺序取末值并标注）。本端点只读。
+    """
+    if conflict_policy not in replaylib.VALID_POLICIES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"未知冲突策略 {conflict_policy!r}，"
+                f"仅支持 {replaylib.POLICY_REJECT!r}（整表拒收）或 {replaylib.POLICY_LAST!r}（取末值）"
+            ),
+        )
+    plan = db.get(Plan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail=f"方案 #{plan_id} 不存在")
+    if plan.status != "published":
+        raise HTTPException(
+            status_code=409,
+            detail=f"方案 #{plan_id} 尚未发布（当前状态：{plan.status}），只能回放已发布方案",
+        )
+    # 归属基准与已发布查询/核验同源：快照还原，或旧记录按留存明细重建（只读）
+    payload = planner.get_plan_payload(db, plan_id)
+
+    content = await file.read()
+    try:
+        rows = replaylib.parse_signal_csv(content)
+        result = replaylib.replay_signal(payload, rows, conflict_policy)
+    except replaylib.CsvStructureError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except replaylib.CsvRejectError as exc:
+        # 非法行（解析阶段）/ 同槽冲突（重建阶段）导致的整表拒收：
+        # 逐项原因随响应返回供页面列出
+        raise HTTPException(
+            status_code=422,
+            detail={"message": exc.message, "code": exc.code, "errors": exc.errors},
+        ) from exc
+
+    result.update(
+        {
+            "plan_id": plan.id,
+            "config_version": plan.config_version,
+            "published_at": plan.published_at,
+            "from_snapshot": payload.get("from_snapshot", False),
+        }
+    )
+    if payload.get("notice"):
+        result["notice"] = payload["notice"]
+        result["field_sources"] = payload.get("field_sources")
+    return result

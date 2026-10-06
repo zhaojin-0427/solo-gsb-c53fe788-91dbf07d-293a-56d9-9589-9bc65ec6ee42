@@ -23,7 +23,10 @@ async function api(path, options = {}) {
   const data = text ? JSON.parse(text) : null;
   if (!res.ok) {
     const detail = data && data.detail ? data.detail : `HTTP ${res.status}`;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    err.status = res.status;
+    err.detail = detail; // 结构化 detail（如回放整表拒收的逐项错误）供页面渲染
+    throw err;
   }
   return data;
 }
@@ -695,16 +698,17 @@ function renderPublishedMigrations(migrations) {
 
 // ---------- 现场地址核验 ----------
 // 已发布方案选择器：可选择任一已发布版本，核验以该版本发布时的落点为基准，
-// 灯具后来改名、删除或再次发布都不影响核验结果。
+// 灯具后来改名、删除或再次发布都不影响核验结果。DMX 信号回放共用同一份列表。
 async function loadVerifyPlans() {
   const plans = await api("/api/plans/published");
-  const sel = $("#verify-plan-select");
-  sel.innerHTML = plans
+  const options = plans
     .map((p) => {
       const when = p.published_at ? new Date(p.published_at).toLocaleString("zh-CN") : "-";
       return `<option value="${p.plan_id}">发布 #${p.plan_id} · 配置 v${p.config_version} · ${when}</option>`;
     })
     .join("");
+  $("#verify-plan-select").innerHTML = options;
+  $("#replay-plan-select").innerHTML = options;
 }
 
 $("#btn-verify").addEventListener("click", async () => {
@@ -825,6 +829,321 @@ function renderVerifyReport(r) {
   box.innerHTML = html;
   box.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
+
+// ---------- DMX 信号回放 ----------
+// 回放状态：报告 + 槽位历史（key "线路:通道" -> 逐帧写入事件）+ 当前帧游标。
+// 帧内查询用二分定位“截至当前帧的最后一次写入”，未写入即初值 0——
+// 与服务端“槽位初值 0、未更新延续上一帧”的重建规则一致。
+let replayState = null;
+
+$("#btn-replay").addEventListener("click", async () => {
+  const planId = $("#replay-plan-select").value;
+  const file = $("#replay-file").files[0];
+  if (!planId) return toast("请选择要回放的已发布方案", "error");
+  if (!file) return toast("请选择信号 CSV 文件", "error");
+  const form = new FormData();
+  form.append("file", file);
+  form.append("conflict_policy", $("#replay-policy").value);
+  try {
+    const report = await api(`/api/plans/${planId}/replay`, { method: "POST", body: form });
+    renderReplayReport(report);
+  } catch (err) {
+    renderReplayRejection(err);
+  }
+});
+
+function replayOwnerLabel(u) {
+  if (u.owner === "fixture") {
+    const suffix = u.fixture_name_source === "unavailable"
+      ? "（名称不可用）" : u.fixture_name_source === "current" ? "（当前名称）" : "";
+    return `灯具 #${u.fixture_id} ${esc(u.fixture_name)}${suffix} · 相对通道 ${u.relative_channel}`;
+  }
+  if (u.owner === "reservation") {
+    return `保留区 #${u.reservation_id}（${u.reservation_start}-${u.reservation_end}）`;
+  }
+  if (u.owner === "unassigned") return "未分配通道";
+  return "归属未知（旧记录无快照）";
+}
+
+function buildReplayState(r) {
+  const histories = new Map();
+  r.frames.forEach((fr, fi) => {
+    for (const u of fr.updates) {
+      const key = `${u.line_id}:${u.channel}`;
+      let h = histories.get(key);
+      if (!h) {
+        h = {
+          key,
+          line_id: u.line_id,
+          channel: u.channel,
+          owner: u.owner,
+          ownerUpdate: u,
+          events: [],
+        };
+        histories.set(key, h);
+      }
+      h.events.push({ fi, value: u.value, row: u.row });
+    }
+  });
+  return { report: r, histories, frameIndex: 0 };
+}
+
+// 截至第 fi 帧（含）该槽位的取值：无写入则为初值 0；同帧多事件取最后一次
+function replayValueAt(history, fi) {
+  let lo = 0;
+  let hi = history.events.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (history.events[mid].fi <= fi) {
+      found = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return found < 0 ? 0 : history.events[found].value;
+}
+
+function renderReplayReport(r) {
+  replayState = buildReplayState(r);
+  replayState.frameIndex = 0;
+  const c = r.counts;
+  let html = "";
+
+  if (r.notice) html += `<div class="banner warn">${esc(r.notice)}</div>`;
+  const baselineNote = r.from_snapshot
+    ? "发布快照（灯具闭区间与保留区均为发布时事实）"
+    : "留存明细（无快照旧记录：灯具落点为发布时事实，灯具外归属未知）";
+  const policyLabel = r.conflict_policy === "last" ? "同槽不同值按文件顺序取末值" : "同槽不同值整表拒收";
+  html += `
+    <div class="banner ok">
+      回放完成（基准：${baselineNote}）：共 <strong>${c.frames}</strong> 帧 /
+      <strong>${c.data_rows}</strong> 行写入，时间 ${c.time_start}–${c.time_end} ms
+      （时长 ${c.duration_ms} ms）；策略：${policyLabel}。
+      灯具槽写入 ${c.fixture_updates}（其中改变读数 ${c.fixture_changed_updates}），
+      保留区 ${c.reservation_updates}、未分配 ${c.unassigned_updates}、归属未知 ${c.unknown_updates}，
+      灯具外非零写入 ${c.external_nonzero_writes}。
+    </div>`;
+
+  if (r.conflicts && r.conflicts.length) {
+    html += `
+      <div class="banner warn">
+        ⚔️ 检测到 <strong>${r.conflicts.length}</strong> 处“同一毫秒同一槽位不同值”，
+        已按文件顺序取<strong>末值</strong>，采用结果标注如下（行顺序会影响读数，请勿随意重排）：
+      </div>
+      <table class="data">
+        <thead><tr><th>时间(ms)</th><th>线路</th><th>通道</th><th>各行取值（按文件顺序）</th><th>已采用</th></tr></thead>
+        <tbody>${r.conflicts
+          .map(
+            (cf) => `<tr><td>${cf.time_ms}</td><td>${cf.line_id}</td><td>${cf.channel}</td>
+              <td>${cf.rows.map((x) => `行 ${x.row} → ${x.value}`).map(esc).join("；")}</td>
+              <td class="diff-bad">行 ${cf.chosen_row} → ${cf.chosen_value}</td></tr>`
+          )
+          .join("")}</tbody>
+      </table>`;
+  }
+
+  // 帧浏览器只渲染一次：滑块在逐帧重绘时不被替换，拖动过程中可以连续回放
+  html += `
+    <div class="replay-nav">
+      <button data-replay-jump="first">⏮ 首帧</button>
+      <button data-replay-jump="prev">◀ 上一帧</button>
+      <input type="range" id="replay-frame-slider" min="0" max="${r.frames.length - 1}"
+        value="0" step="1" style="flex:1" />
+      <button data-replay-jump="next">下一帧 ▶</button>
+      <button data-replay-jump="last">末帧 ⏭</button>
+      <strong id="replay-frame-label"></strong>
+    </div>
+    <div id="replay-frame-view"></div>`;
+
+  $("#replay-result").innerHTML = html;
+  drawReplayFrame();
+  $("#replay-result").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function renderReplayRejection(err) {
+  const box = $("#replay-result");
+  let html = "";
+  const detail = err && err.detail;
+  if (detail && typeof detail === "object" && detail.message) {
+    html += `<div class="banner err"><strong>整表拒收：</strong>${esc(detail.message)}</div>`;
+    if (detail.code === "slot_conflicts") {
+      html += `
+        <h3>⚔️ 同毫秒同槽不同值</h3>
+        <table class="data">
+          <thead><tr><th>时间(ms)</th><th>线路</th><th>通道</th><th>各行取值（按文件顺序）</th><th>末值策略将采用</th></tr></thead>
+          <tbody>${(detail.errors || [])
+            .map(
+              (c) => `<tr><td>${c.time_ms}</td><td>${c.line_id}</td><td>${c.channel}</td>
+                <td>${c.rows.map((x) => `行 ${x.row} → ${x.value}`).map(esc).join("；")}</td>
+                <td class="muted">行 ${c.chosen_row} → ${c.chosen_value}</td></tr>`
+            )
+            .join("")}</tbody>
+        </table>`;
+    } else {
+      html += `
+        <h3>⚠️ 非法行</h3>
+        <table class="data">
+          <thead><tr><th>行号</th><th>原始内容</th><th>原因</th></tr></thead>
+          <tbody>${(detail.errors || [])
+            .map(
+              (e) => `<tr><td>${e.row}</td><td><code>${esc(e.raw ?? "")}</code></td>
+                <td>${(e.reasons || []).map(esc).join("；")}</td></tr>`
+            )
+            .join("")}</tbody>
+        </table>`;
+    }
+  } else {
+    html = `<div class="banner err"><strong>回放被拒绝：</strong>${esc((err && err.message) || "请求失败")}</div>`;
+  }
+  box.innerHTML = html;
+  toast("回放被拒绝", "error");
+}
+
+function drawReplayFrame() {
+  const s = replayState;
+  if (!s) return;
+  const r = s.report;
+  const fi = s.frameIndex;
+  const frame = r.frames[fi];
+
+  // 滑块与帧标签原地更新（不重建滑块 DOM，保持拖动连续性）
+  const slider = $("#replay-frame-slider");
+  if (slider && Number(slider.value) !== fi) slider.value = fi;
+  const label = $("#replay-frame-label");
+  if (label) {
+    label.textContent = `第 ${fi + 1}/${r.frames.length} 帧 · t = ${frame.time_ms} ms · 本帧 ${frame.updates.length} 行写入`;
+  }
+
+  let html = "";
+
+  // 本帧逐行写入（文件顺序，即末值策略的裁决顺序）
+  html += `
+    <h3>本帧写入（按文件顺序）</h3>
+    <table class="data">
+      <thead><tr><th>行号</th><th>线路</th><th>通道</th><th>归属</th><th>值</th></tr></thead>
+      <tbody>${frame.updates
+        .map((u) => {
+          const valueCell = u.changed
+            ? `<span class="diff-bad">${u.previous_value} → ${u.value}</span>`
+            : `${u.value}（无变化）`;
+          return `<tr${u.value === 0 ? ' class="zero-row"' : ""}>
+            <td>${u.row}</td><td>${u.line_id}</td><td>${u.channel}</td>
+            <td>${replayOwnerLabel(u)}</td><td>${valueCell}</td></tr>`;
+        })
+        .join("")}</tbody>
+    </table>`;
+
+  // 本帧各灯具相对通道读数（只列非零通道；本帧改变的通道高亮标注）
+  const changedFixtureChannels = new Map(); // key "灯具ID:相对通道" -> 写入事件
+  for (const u of frame.updates) {
+    if (u.owner === "fixture") changedFixtureChannels.set(`${u.fixture_id}:${u.relative_channel}`, u);
+  }
+  html += `<h3>灯具相对通道读数（t = ${frame.time_ms} ms）</h3><div class="replay-fixtures">`;
+  for (const fx of r.final_fixtures) {
+    const chips = [];
+    for (let rel = 1; rel <= fx.channels; rel++) {
+      const h = s.histories.get(`${fx.line_id}:${fx.start + rel - 1}`);
+      const v = replayValueAt(h || { events: [] }, fi);
+      if (v === 0) continue;
+      const ch = changedFixtureChannels.get(`${fx.fixture_id}:${rel}`);
+      const change = ch
+        ? ` <em class="chg">${ch.previous_value}→${ch.value}</em>`
+        : "";
+      chips.push(
+        `<span class="dmx-chip${ch ? " changed" : ""}">ch${rel}: <strong>${v}</strong>${change}</span>`
+      );
+    }
+    const nameSuffix = publishedNameSuffix(fx.name_source);
+    html += `
+      <div class="replay-fixture">
+        <div class="title">#${fx.fixture_id} ${esc(fx.name)}${nameSuffix}
+          <span class="muted">线路 ${fx.line_id} · 地址 ${fx.start}-${fx.end} · ${fx.channels} 通道</span>
+        </div>
+        <div>${chips.length ? chips.join(" ") : '<span class="muted">全部为 0（黑场）</span>'}</div>
+      </div>`;
+  }
+  html += "</div>";
+
+  // 灯具外槽位：当前帧所有非零值（含上一帧延续），按归属分组。
+  // 无快照时归属一律 unknown——绝不按当前保留区判为空位异常。
+  const groups = { reservation: [], unassigned: [], unknown: [] };
+  for (const h of s.histories.values()) {
+    if (h.owner === "fixture") continue;
+    const v = replayValueAt(h, fi);
+    if (v === 0) continue;
+    const nowEvent = h.events[h.events.length - 1];
+    const writtenNow = nowEvent && nowEvent.fi === fi;
+    groups[h.owner].push({ h, v, writtenNow });
+  }
+  const sortSlot = (a, b) =>
+    a.h.line_id - b.h.line_id || a.h.channel - b.h.channel;
+  groups.reservation.sort(sortSlot);
+  groups.unassigned.sort(sortSlot);
+  groups.unknown.sort(sortSlot);
+
+  const slotRows = (items) =>
+    items
+      .map(({ h, v, writtenNow }) => {
+        const u = h.ownerUpdate;
+        const where = h.owner === "reservation"
+          ? `保留区 #${u.reservation_id}（${u.reservation_start}-${u.reservation_end}）`
+          : h.owner === "unassigned"
+            ? "未分配"
+            : "归属未知";
+        return `<tr${writtenNow ? ' class="written-now"' : ""}>
+          <td>${h.line_id}</td><td>${h.channel}</td><td>${where}</td>
+          <td><strong>${v}</strong>${writtenNow ? ' <span class="muted">（本帧写入）</span>' : ' <span class="muted">（延续）</span>'}</td></tr>`;
+      })
+      .join("");
+
+  if (r.baseline.reservations_known) {
+    html += `
+      <h3>保留区非零值 <span class="count">${groups.reservation.length}</span></h3>
+      ${groups.reservation.length
+        ? `<table class="data"><thead><tr><th>线路</th><th>通道</th><th>归属</th><th>当前值</th></tr></thead>
+           <tbody>${slotRows(groups.reservation)}</tbody></table>`
+        : '<p class="muted">当前帧保留区通道全部为 0。</p>'}
+      <h3>未分配通道非零值 <span class="count">${groups.unassigned.length}</span></h3>
+      ${groups.unassigned.length
+        ? `<table class="data"><thead><tr><th>线路</th><th>通道</th><th>归属</th><th>当前值</th></tr></thead>
+           <tbody>${slotRows(groups.unassigned)}</tbody></table>`
+        : '<p class="muted">当前帧未分配通道全部为 0。</p>'}`;
+  } else {
+    html += `
+      <h3>灯具外非零值（归属未知） <span class="count">${groups.unknown.length}</span></h3>
+      <p class="muted">
+        该发布记录无快照，保留区占用无法还原：以下灯具外非零值继续显示，
+        但归属未知——不会用<strong>当前</strong>保留区把它们判成空位异常。
+      </p>
+      ${groups.unknown.length
+        ? `<table class="data"><thead><tr><th>线路</th><th>通道</th><th>归属</th><th>当前值</th></tr></thead>
+           <tbody>${slotRows(groups.unknown)}</tbody></table>`
+        : '<p class="muted">当前帧灯具外通道全部为 0。</p>'}`;
+  }
+
+  $("#replay-frame-view").innerHTML = html;
+}
+
+// 帧浏览器交互（事件委托：按钮跳转、滑块拖动）
+$("#replay-result").addEventListener("click", (e) => {
+  const jump = e.target.dataset && e.target.dataset.replayJump;
+  if (!jump || !replayState) return;
+  const last = replayState.report.frames.length - 1;
+  const cur = replayState.frameIndex;
+  replayState.frameIndex =
+    jump === "first" ? 0
+    : jump === "last" ? last
+    : jump === "prev" ? Math.max(0, cur - 1)
+    : Math.min(last, cur + 1);
+  drawReplayFrame();
+});
+$("#replay-result").addEventListener("input", (e) => {
+  if (!e.target.id || e.target.id !== "replay-frame-slider" || !replayState) return;
+  replayState.frameIndex = Number(e.target.value);
+  drawReplayFrame();
+});
 
 // ---------- 启动 ----------
 (async function init() {
