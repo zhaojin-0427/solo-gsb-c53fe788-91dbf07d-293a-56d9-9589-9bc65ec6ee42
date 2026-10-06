@@ -99,6 +99,32 @@ code { background: #eef2f7; padding: 1px 5px; border-radius: 4px; font-size: 12p
 #verify-result p { margin: 4px 0 8px; }
 .diff-bad { color: var(--danger); font-weight: 600; }
 
+/* DMX 信号回放 */
+#replay-panel select { min-width: 220px; }
+#replay-result h3 { font-size: 14px; margin: 18px 0 8px; }
+#replay-result p { margin: 4px 0 8px; }
+.replay-controls {
+  display: flex; align-items: center; gap: 8px; margin: 14px 0 10px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+}
+.replay-controls input[type="range"] { flex: 1; }
+.replay-frame-label { font-size: 13px; color: var(--muted); white-space: nowrap; }
+.replay-fixture {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; margin-bottom: 10px;
+}
+.replay-fixture-head { display: flex; gap: 10px; align-items: baseline; margin-bottom: 8px; font-size: 13px; }
+.ch-grid { display: flex; flex-wrap: wrap; gap: 4px; }
+.ch-cell {
+  display: inline-block; min-width: 46px; text-align: center;
+  border: 1px solid var(--border); border-radius: 4px; padding: 2px 4px;
+  font-size: 11px; font-family: monospace; color: var(--muted); background: #f8fafc;
+}
+.ch-cell.nonzero { color: var(--text); background: #e0f2fe; border-color: #7dd3fc; }
+.ch-cell.changed { color: #7c2d12; background: #ffedd5; border-color: var(--migrated); font-weight: 700; }
+.replay-changes { margin-top: 6px; font-size: 12px; }
+.replay-region-list { font-size: 13px; line-height: 1.9; }
+
 #conflict-panel { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
 #conflict-panel h2 { color: var(--danger); margin-top: 0; }
 #conflict-list li { margin: 4px 0; }

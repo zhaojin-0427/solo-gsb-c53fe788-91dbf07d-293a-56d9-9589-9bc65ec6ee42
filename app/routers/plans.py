@@ -1,4 +1,4 @@
-"""编排预览、原子发布、已发布地址表查询与 CSV 下载、现场地址核验。"""
+"""编排预览、原子发布、已发布地址表查询与 CSV 下载、现场地址核验、DMX 信号回放。"""
 from __future__ import annotations
 
 import csv
@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from .. import planner, verify
+from .. import planner, replay, verify
 from ..database import get_db
 from ..models import Plan
 from ..services import get_config_version
@@ -162,4 +162,54 @@ async def verify_on_site(plan_id: int, file: UploadFile = File(...), db: Session
     if payload.get("notice"):
         report["notice"] = payload["notice"]
         report["field_sources"] = payload.get("field_sources")
+    return report
+
+
+@router.post("/{plan_id}/replay")
+async def replay_signals(
+    plan_id: int,
+    file: UploadFile = File(...),
+    on_conflict: str = "reject",
+    db: Session = Depends(get_db),
+):
+    """DMX 信号回放：上传信号 CSV，以所选已发布方案发布时的落点重建帧。
+
+    基准取自发布快照（旧记录取留存明细）中的灯具闭区间与保留区，
+    绝不使用当前灯具落点——发布会回写灯具既有地址，历史回放不得随之漂移。
+    同一毫秒同一槽位出现不同值时按 on_conflict 裁决：reject 整表拒收（422），
+    last 按文件顺序取末值并在结果中标注。本端点只读，不修改编排与发布数据。
+    """
+    if on_conflict not in replay.CONFLICT_POLICIES:
+        raise HTTPException(
+            status_code=422,
+            detail="on_conflict 仅支持 reject（整表拒收）或 last（按文件顺序取末值并标注）",
+        )
+    plan = db.get(Plan, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail=f"方案 #{plan_id} 不存在")
+    if plan.status != "published":
+        raise HTTPException(
+            status_code=409,
+            detail=f"方案 #{plan_id} 尚未发布（当前状态：{plan.status}），只能回放已发布方案",
+        )
+    # 与已发布查询/核验同源的基准：快照还原或旧记录留存明细（只读）
+    payload = planner.get_plan_payload(db, plan_id)
+
+    content = await file.read()
+    try:
+        rows = replay.parse_signal_csv(content)
+        report = replay.build_report(payload, rows, on_conflict)
+    except replay.ConflictError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except replay.SignalCsvError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    report.update(
+        {
+            "plan_id": plan.id,
+            "config_version": plan.config_version,
+            "published_at": plan.published_at,
+            "from_snapshot": payload.get("from_snapshot", False),
+        }
+    )
     return report

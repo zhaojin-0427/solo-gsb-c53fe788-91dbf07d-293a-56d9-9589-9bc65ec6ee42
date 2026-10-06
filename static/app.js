@@ -696,15 +696,17 @@ function renderPublishedMigrations(migrations) {
 // ---------- 现场地址核验 ----------
 // 已发布方案选择器：可选择任一已发布版本，核验以该版本发布时的落点为基准，
 // 灯具后来改名、删除或再次发布都不影响核验结果。
+// 同一列表同时供 DMX 信号回放选择版本（回放同样以发布时落点为基准）。
 async function loadVerifyPlans() {
   const plans = await api("/api/plans/published");
-  const sel = $("#verify-plan-select");
-  sel.innerHTML = plans
+  const options = plans
     .map((p) => {
       const when = p.published_at ? new Date(p.published_at).toLocaleString("zh-CN") : "-";
       return `<option value="${p.plan_id}">发布 #${p.plan_id} · 配置 v${p.config_version} · ${when}</option>`;
     })
     .join("");
+  $("#verify-plan-select").innerHTML = options;
+  $("#replay-plan-select").innerHTML = options;
 }
 
 $("#btn-verify").addEventListener("click", async () => {
@@ -824,6 +826,193 @@ function renderVerifyReport(r) {
 
   box.innerHTML = html;
   box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// ---------- DMX 信号回放 ----------
+// 回放视图状态：report 为服务端重建结果（帧 + 槽位归类）；values 为当前帧
+// 之前的累积槽位读数（槽位初值 0，未更新的值延续上一帧）；idx 为当前帧下标。
+const replayView = { report: null, idx: -1, values: new Map() };
+
+$("#btn-replay").addEventListener("click", async () => {
+  const planId = $("#replay-plan-select").value;
+  const file = $("#replay-file").files[0];
+  const policy = $("#replay-conflict-policy").value;
+  if (!planId) return toast("请选择要回放的已发布方案", "error");
+  if (!file) return toast("请选择信号 CSV 文件", "error");
+  const form = new FormData();
+  form.append("file", file);
+  try {
+    const report = await api(`/api/plans/${planId}/replay?on_conflict=${policy}`, {
+      method: "POST",
+      body: form,
+    });
+    replayView.report = report;
+    replayView.idx = -1;
+    replayView.values = new Map();
+    renderReplayShell(report);
+    if (report.counts.frames > 0) gotoReplayFrame(0);
+  } catch (err) {
+    replayView.report = null;
+    $("#replay-result").innerHTML = "";
+    toast(err.message, "error");
+  }
+});
+
+// 渲染回放结果骨架：结论横幅、冲突标注、帧导航控件；帧内容见 renderReplayFrame。
+function renderReplayShell(r) {
+  const c = r.counts;
+  let html = "";
+  (r.notices || []).forEach((n) => {
+    html += `<div class="banner warn">${esc(n)}</div>`;
+  });
+  const baseNote = r.from_snapshot
+    ? "发布快照（含发布时保留区）"
+    : "留存明细（无快照旧记录，灯具外归属未知）";
+  html += `<div class="banner ok">🎞️ 已重建 ${c.frames} 帧：${c.rows} 行信号，触及 ${c.slots_touched} 个槽位、
+    ${c.fixtures_touched} 台灯具（基准：发布 #${r.plan_id}，${baseNote}）。
+    槽位初值 0，未更新的值延续上一帧。</div>`;
+
+  if (r.conflicts_resolved && r.conflicts_resolved.length) {
+    html += `
+      <h3>⚠️ 同毫秒同槽冲突（已按文件顺序取末值）<span class="count">${r.conflicts_resolved.length}</span></h3>
+      <table class="data">
+        <thead><tr><th>时间(ms)</th><th>线路</th><th>通道</th><th>涉及行</th><th>出现值</th><th>采用值</th></tr></thead>
+        <tbody>${r.conflicts_resolved
+          .map(
+            (k) => `<tr><td>${k.t}</td><td>${k.line}</td><td>${k.channel}</td>
+              <td>${k.rows.join(", ")}</td><td>${k.values.join(" → ")}</td>
+              <td class="diff-bad">${k.taken}</td></tr>`
+          )
+          .join("")}</tbody>
+      </table>`;
+  }
+
+  if (!c.frames) {
+    html += `<p class="muted">CSV 中没有数据行，未产生任何帧。</p>`;
+    $("#replay-result").innerHTML = html;
+    return;
+  }
+
+  html += `
+    <div class="replay-controls">
+      <button id="replay-first" title="第一帧">⏮</button>
+      <button id="replay-prev">◀ 上一帧</button>
+      <input type="range" id="replay-slider" min="0" max="${c.frames - 1}" value="0" />
+      <button id="replay-next">下一帧 ▶</button>
+      <button id="replay-last" title="最后一帧">⏭</button>
+      <span id="replay-frame-label" class="replay-frame-label"></span>
+    </div>
+    <div id="replay-frame-view"></div>`;
+  $("#replay-result").innerHTML = html;
+  $("#replay-first").addEventListener("click", () => gotoReplayFrame(0));
+  $("#replay-prev").addEventListener("click", () => gotoReplayFrame(replayView.idx - 1));
+  $("#replay-next").addEventListener("click", () => gotoReplayFrame(replayView.idx + 1));
+  $("#replay-last").addEventListener("click", () => gotoReplayFrame(r.counts.frames - 1));
+  $("#replay-slider").addEventListener("input", (e) => gotoReplayFrame(Number(e.target.value)));
+}
+
+// 跳转到第 i 帧：前进时逐帧累积，回退时从第 0 帧重放，保证读数与逐帧推进一致。
+function gotoReplayFrame(i) {
+  const r = replayView.report;
+  if (!r || !r.frames.length) return;
+  i = Math.max(0, Math.min(r.frames.length - 1, i));
+  if (i < replayView.idx) {
+    replayView.values = new Map();
+    replayView.idx = -1;
+  }
+  for (let f = replayView.idx + 1; f <= i; f++) {
+    for (const ch of r.frames[f].changes) {
+      replayView.values.set(`${ch.line}:${ch.channel}`, ch.value);
+    }
+  }
+  replayView.idx = i;
+  renderReplayFrame();
+}
+
+// 渲染当前帧：按灯具展示相对通道读数（高亮本帧变化）及变化清单；
+// 有快照时列出保留区与未分配通道的非零值，旧记录列出灯具外归属未知的非零值。
+function renderReplayFrame() {
+  const r = replayView.report;
+  const frame = r.frames[replayView.idx];
+  $("#replay-slider").value = replayView.idx;
+  $("#replay-frame-label").textContent =
+    `第 ${replayView.idx + 1}/${r.counts.frames} 帧 · t=${frame.t} ms · 本帧更新 ${frame.changes.length} 个槽位`;
+
+  const changedKeys = new Set(frame.changes.map((c) => `${c.line}:${c.channel}`));
+  const regionOf = (key) => r.slot_regions[key] || { kind: "unknown" };
+
+  // 本帧变化按灯具分组（相对通道），灯具外的变化归入保留区/未分配/未知
+  const changesByFixture = new Map();
+  for (const c of frame.changes) {
+    const reg = regionOf(`${c.line}:${c.channel}`);
+    if (reg.kind === "fixture") {
+      if (!changesByFixture.has(reg.fixture_id)) changesByFixture.set(reg.fixture_id, []);
+      changesByFixture.get(reg.fixture_id).push({ ...c, rel: reg.rel_channel });
+    }
+  }
+
+  const touched = new Set(r.fixtures_touched);
+  let html = "";
+  for (const f of r.fixtures) {
+    if (!touched.has(f.fixture_id)) continue;
+    const cells = [];
+    for (let k = 1; k <= f.channels; k++) {
+      const key = `${f.line_id}:${f.start + k - 1}`;
+      const v = replayView.values.get(key) || 0;
+      const cls = ["ch-cell"];
+      if (changedKeys.has(key)) cls.push("changed");
+      if (v !== 0) cls.push("nonzero");
+      cells.push(
+        `<span class="${cls.join(" ")}" title="相对通道 ${k}（线路 ${f.line_id} 通道 ${f.start + k - 1}）：${v}">${k}·${v}</span>`
+      );
+    }
+    const chg = (changesByFixture.get(f.fixture_id) || [])
+      .map((c) => `ch${c.rel}: ${c.previous}→${c.value}`)
+      .join("，");
+    html += `
+      <div class="replay-fixture">
+        <div class="replay-fixture-head">
+          <strong>#${f.fixture_id} ${esc(f.name)}</strong>${publishedNameSuffix(f.name_source)}
+          <span class="muted">线路 ${f.line_id} · ${f.start}-${f.end}（${f.channels}ch）</span>
+        </div>
+        <div class="ch-grid">${cells.join("")}</div>
+        <div class="muted replay-changes">${chg ? `本帧变化：${esc(chg)}` : "本帧无变化"}</div>
+      </div>`;
+  }
+  const untouched = r.fixtures.length - touched.size;
+  if (untouched > 0) {
+    html += `<p class="muted">另有 ${untouched} 台灯具全程无信号（读数恒为 0），未展开。</p>`;
+  }
+
+  // 保留区/未分配（快照）或灯具外归属未知（旧记录）的非零值：按当前帧累积读数列出
+  if (r.from_snapshot) {
+    html += replayRegionList("🚧 保留区非零值", "reserved", changedKeys);
+    html += replayRegionList("⬚ 未分配通道非零值", "unallocated", changedKeys);
+  } else {
+    html += replayRegionList("❓ 灯具之外的非零值（归属未知）", "unknown", changedKeys);
+  }
+  $("#replay-frame-view").innerHTML = html;
+}
+
+// 列出某类区域在当前帧的非零槽位读数；本帧更新的槽位加粗标注。
+function replayRegionList(title, kind, changedKeys) {
+  const r = replayView.report;
+  const items = [];
+  for (const [key, reg] of Object.entries(r.slot_regions)) {
+    if (reg.kind !== kind) continue;
+    const v = replayView.values.get(key) || 0;
+    if (v === 0) continue;
+    const [line, channel] = key.split(":");
+    const reason = reg.reason ? `（${reg.reason}）` : "";
+    const text = `线路 ${line} 通道 ${channel} = ${v}${reason}`;
+    items.push(changedKeys.has(key) ? `<strong>${esc(text)}</strong>` : esc(text));
+  }
+  return (
+    `<h3>${title} <span class="count">${items.length}</span></h3>` +
+    (items.length
+      ? `<p class="replay-region-list">${items.join("；")}</p>`
+      : `<p class="muted">本帧无。</p>`)
+  );
 }
 
 // ---------- 启动 ----------
